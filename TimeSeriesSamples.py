@@ -38,7 +38,7 @@ def add_years(d, years):
 Get sample data from the Federal Reserve API
 """
 from fredapi import Fred
-fredkey = '93873d40f10c20fe6f6e75b1ad0aed4d' # get from https://research.stlouisfed.org/docs/api/fred/
+fredkey = 'XXXXXXXXXXXXXXXXXXXXXX' # get from https://research.stlouisfed.org/docs/api/fred/
 fred = Fred(api_key=fredkey)
 
 seriesNameDict = {'T10Y2Y':'10 Year Treasury Constant Maturity Minus 2 Year Treasury Constant Maturity', 
