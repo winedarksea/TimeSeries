@@ -10,18 +10,80 @@ Incoming data format is a 'long' data format:
 Missing data here is handled with a fill-forward when necessary. 
 For intermittent data, filling with zero may be better
 
-pip install fredapi
-"""
-forecast_length = 12
-frequency = 'MS'  # 'Offset aliases' from https://pandas.pydata.org/pandas-docs/stable/user_guide/timeseries.html
-no_negatives = True # True if all forecasts should be positive
+Most ts models don't need much parameter tuning. 
+Tuning GluonTS epochs, context_length and adding features is one possibility
 
+pip install fredapi # if using samples
+conda install -c conda-forge fbprophet
+pip install mxnet==1.4.1
+    pip install mxnet-cu90mkl==1.4.1 # if you want GPU and have Intel CPU
+pip install gluonts==0.4.0
+    pip install git+https://github.com/awslabs/gluon-ts.git #if you want dev version
+pip install pmdarima==1.4.0 
+pip uninstall numpy # might be necessary, even twice, followed by the following
+pip install numpy==1.17.4 # gluonts likes to force numpy back to 1.14, but 1.17 seems to be fine with it
+"""
 import traceback
 import numpy as np
 import pandas as pd
 import datetime
-import sys
 
+use_sample_data = True # whether to use sample FRED time series or use a new dataset
+fredkey = 'xxxxxxxxxxxxxxxxx' # get from https://research.stlouisfed.org/docs/api/fred/
+forecast_length = 90 # how much you will be predicting
+frequency = '1D'  # 'Offset aliases' from https://pandas.pydata.org/pandas-docs/stable/user_guide/timeseries.html
+no_negatives = True # True if all forecasts should be positive
+series_to_sample = 50 # number of series to evaluate on
+na_tolerance = 0.3 # 0 to 1, drop time series if up to this percent of values are na
+drop_most_recent = False # if to drop the most recent date and value (useful if most recent is incomplete month, say)
+figures = False # whether to plot some sample time series
+drop_data_older_than_years = 5 # at what point to cut old data
+fill_na_zero = False # use for intermittent time series, where NA just means zero (sales, say)
+
+# import and modify dataset to have date/series_id/value columns
+if not use_sample_data:
+    timeseries_long = pd.read_csv("MonthlyWarehouseProductSales.csv")
+    timeseries_long['series_id'] = timeseries_long['WarehouseID'] + '|' + timeseries_long['ProductID']
+    timeseries_long['value'] = timeseries_long['UnitSales']
+    timeseries_long['date'] = pd.to_datetime(timeseries_long['MonthDateKey'], format = '%Y%m%d')
+    timeseries_long = timeseries_long[['date','series_id','value']]
+
+
+"""
+Get sample data from the Federal Reserve API
+"""
+if use_sample_data:
+    from fredapi import Fred
+
+    fred = Fred(api_key=fredkey)
+    
+    seriesNameDict = {'T10Y2Y':'10 Year Treasury Constant Maturity Minus 2 Year Treasury Constant Maturity', 
+                      'DGS10': '10 Year Treasury Constant Maturity Rate',
+                      'DCOILWTICO':'Crude Oil West Texas Intermediate Cushing Oklahoma', 
+                      'SP500': 'S&P 500', 
+                      'DEXUSEU': 'US Euro Foreign Exchange Rate',
+                      'DEXCHUS': 'China US Foreign Exchange Rate',
+                      'DEXCAUS' : 'Canadian to US Dollar Exchange Rate Daily',
+                      'VIXCLS': 'CBOE Volatility Index: VIX',  # this is a more irregular series
+                      'T10YIE' : '10 Year Breakeven Inflation Rate',
+                      'USEPUINDXD': 'Economic Policy Uncertainty Index for United States' # also very irregular
+                      }
+    
+    series_desired = list(seriesNameDict.keys())
+    
+    fred_timeseries = pd.DataFrame(columns = ['date', 'value', 'series_id','series_name'])
+    
+    for series in series_desired:
+        data = fred.get_series(series)
+        try:
+            series_name = seriesNameDict[series]
+        except Exception:
+            series_name = series
+        data_df = pd.DataFrame({'date':data.index, 'value':data, 'series_id':series, 'series_name':series_name})
+        data_df.reset_index(drop=True, inplace = True)
+        fred_timeseries = pd.concat([fred_timeseries, data_df], axis = 0, ignore_index = True)
+
+    timeseries_long = fred_timeseries
 
 def add_years(d, years):
     """Return a date that's `years` years after the date (or datetime)
@@ -35,54 +97,12 @@ def add_years(d, years):
         return d + (datetime.date(d.year + years, 1, 1) - datetime.date(d.year, 1, 1))
 
 """
-Get sample data from the Federal Reserve API
-"""
-from fredapi import Fred
-fredkey = 'XXXXXXXXXXXXXXXXXXXXXX' # get from https://research.stlouisfed.org/docs/api/fred/
-fred = Fred(api_key=fredkey)
-
-seriesNameDict = {'T10Y2Y':'10 Year Treasury Constant Maturity Minus 2 Year Treasury Constant Maturity', 
-                  'DGS10': '10 Year Treasury Constant Maturity Rate',
-                  'DCOILWTICO':'Crude Oil West Texas Intermediate Cushing Oklahoma', 
-                  'SP500': 'S&P 500', 
-                  'DEXUSEU': 'US Euro Foreign Exchange Rate',
-                  'DEXCHUS': 'China US Foreign Exchange Rate',
-                  'DEXCAUS' : 'Canadian to US Dollar Exchange Rate Daily',
-                  'VIXCLS': 'CBOE Volatility Index: VIX',  # this is a more irregular series
-                  'T10YIE' : '10 Year Breakeven Inflation Rate',
-                  'USEPUINDXD': 'Economic Policy Uncertainty Index for United States' # also very irregular
-                  }
-
-series_desired = list(seriesNameDict.keys())
-
-fred_timeseries = pd.DataFrame(columns = ['date', 'value', 'series_id','series_name'])
-
-for series in series_desired:
-    data = fred.get_series(series)
-    try:
-        series_name = seriesNameDict[series]
-    except Exception:
-        series_name = series
-    data_df = pd.DataFrame({'date':data.index, 'value':data, 'series_id':series, 'series_name':series_name})
-    data_df.reset_index(drop=True, inplace = True)
-    fred_timeseries = pd.concat([fred_timeseries, data_df], axis = 0, ignore_index = True)
-
-
-timeseries_long = fred_timeseries
-# timeseries_long = pd.read_csv("timeseriestestsample.csv")
-timeseries_long = pd.read_csv("MonthlyWarehouseProductSales.csv")
-timeseries_long['series_id'] = timeseries_long['WarehouseID'] + '|' + timeseries_long['ProductID']
-timeseries_long['value'] = timeseries_long['UnitSales']
-timeseries_long['date'] = pd.to_datetime(timeseries_long['MonthDateKey'], format = '%Y%m%d')
-timeseries_long = timeseries_long[['date','series_id','value']]
-
-"""
 Process Long Data
 """
 # Attempt to convert to datetime format if not already
 timeseries_long['date'] = pd.to_datetime(timeseries_long['date'], infer_datetime_format = True)
 # drop older data, because too much of a good thing...
-time_cutoff = add_years(datetime.datetime.now(), -5)
+time_cutoff = add_years(datetime.datetime.now(), -abs(drop_data_older_than_years))
 timeseries_long = timeseries_long[timeseries_long['date'] >= time_cutoff]
 # pivot to different shape for some methods
 timeseries_seriescols = timeseries_long.pivot_table(values='value', index='date', columns='series_id')
@@ -90,17 +110,20 @@ timeseries_seriescols = timeseries_seriescols.sort_index()
 # fill missing dates in index
 timeseries_seriescols = timeseries_seriescols.asfreq(frequency, fill_value=np.nan)
 # remove series with way too many NaNs - probably those of a different frequency, or brand new
-timeseries_seriescols = timeseries_seriescols.dropna(axis = 1, thresh=int(len(timeseries_seriescols.index) * 0.05))
+timeseries_seriescols = timeseries_seriescols.dropna(axis = 1, thresh=int(len(timeseries_seriescols.index) * na_tolerance))
 # transpose to another possible shape
 # timeseries_datecols = timeseries_seriescols.transpose()
 
-timeseries_seriescols = timeseries_seriescols.fillna(0)
-print("FILLED NA WITH ZERO which you don't usually want to do!")
+if drop_most_recent:
+    timeseries_seriescols.drop(timeseries_seriescols.tail(1).index, inplace = True)
+
+if fill_na_zero:
+    timeseries_seriescols = timeseries_seriescols.fillna(0)
+    print("Filled NA with zero - only use for intermittent time series!")
 
 """ 
 Plot Time Series
 """
-figures = False
 if figures:
     try:
         # plot one and save
@@ -174,7 +197,7 @@ class ModelResult(object):
     def __str__(self):
         return "Time Series Model Result: " + str(self.name)
     def result_message(self):
-        return "TS Method: " + str(self.name) + " of Avg SMAPE: " + str(self.overall_smape)
+        print("TS Method: " + str(self.name) + " of Avg SMAPE: " + str(self.overall_smape))
 
 class EvaluationReturn(object):
     def __init__(self, model_performance = np.nan, per_series_mae = np.nan, per_series_smape = np.nan, errors = np.nan):
@@ -182,7 +205,7 @@ class EvaluationReturn(object):
         self.per_series_mae = per_series_mae
         self.per_series_smape = per_series_smape
         self.errors = errors
-subset = 'All'
+subset = series_to_sample
 
 def model_evaluator(train, test, subset = 'All'):
     model_results = pd.DataFrame(columns = ['method', 'runtime', 'overall_smape', 'overall_mae', 'object_name'])
@@ -343,43 +366,97 @@ def model_evaluator(train, test, subset = 'All'):
     model_results = pd.concat([model_results, currentResult], ignore_index = True).reset_index(drop = True)
     dETS.result_message()
     """
-    Markov AutoRegression - not yet stable release
+    Markov AutoRegression - new to statsmodels 1.10, make sure you have recent version
+    """
     
-    from statsmodels.tsa.regime_switching.markov_autoregression import MarkovAutoregression
-    from statsmodels.tsa.regime_switching.markov_regression import MarkovRegression
+    MarkovReg = ModelResult("MarkovRegression")
+    try:
+        from statsmodels.tsa.regime_switching.markov_regression import MarkovRegression
+        startTime = datetime.datetime.now()
+        forecast = pd.DataFrame()
+        for series in train.columns:
+            try:
+                current_series = train[series].copy()
+                current_series = current_series.fillna(method='ffill').fillna(method='bfill')
+                model = MarkovRegression(current_series, k_regimes=3, trend='nc', switching_variance=True).fit()
+                maPred = model.predict(start=testStartDate, end=testEndDate)
+            except Exception:
+                try: # ETS if the above failed
+                    sesModel = SimpleExpSmoothing(current_series).fit()
+                    maPred = sesModel.predict(start=testStartDate, end=testEndDate)
+                except Exception:
+                    maPred = (np.zeros((forecast_length,)))
+            if no_negatives:
+                try:
+                    maPred = pd.Series(np.where(maPred > 0, maPred, 0))
+                except Exception:
+                    maPred = maPred.where(maPred > 0, 0) 
+            forecast = pd.concat([forecast, maPred], axis = 1)
+        MarkovReg.forecast = forecast.values
+        MarkovReg.runtime = datetime.datetime.now() - startTime
+        
+        MarkovReg.mae = pd.DataFrame(mae(test.values, MarkovReg.forecast)).mean(axis=0, skipna = True)
+        MarkovReg.overall_mae = np.nanmean(MarkovReg.mae)
+        MarkovReg.smape = smape(test.values, MarkovReg.forecast)
+        MarkovReg.overall_smape = np.nanmean(MarkovReg.smape)
+    except Exception as e:
+        print(e)
+        error_list.extend([traceback.format_exc()])
+    
+    currentResult = pd.DataFrame({
+            'method': MarkovReg.name, 
+            'runtime': MarkovReg.runtime, 
+            'overall_smape': MarkovReg.overall_smape, 
+            'overall_mae': MarkovReg.overall_mae,
+            'object_name': 'MarkovReg'
+            }, index = [0])
+    model_results = pd.concat([model_results, currentResult], ignore_index = True).reset_index(drop = True)
+    
     MarkovAuto = ModelResult("MarkovAutoregression")
-    
-    startTime = datetime.datetime.now()
-    forecast = pd.DataFrame()
-    for series in train.columns:
-        current_series = train[series].copy()
-        current_series = current_series.fillna(method='ffill').fillna(method='bfill')
-        model = MarkovRegression(current_series, k_regimes=3, trend='nc', switching_variance=True).fit()
-        maPred = model.predict(start=testStartDate, end=testEndDate)
-        if no_negatives:
-            maPred = maPred.where(maPred > 0, 0)   # replace all negatives with zeroes, remove if you want negatives!
-        forecast = pd.concat([forecast, maPred], axis = 1)
-    MarkovAuto.forecast = forecast.values
-    MarkovAuto.runtime = datetime.datetime.now() - startTime
-    
-    MarkovAuto.mae = pd.DataFrame(mae(test.values, MarkovAuto.forecast)).mean(axis=0, skipna = True)
-    MarkovAuto.overall_mae = np.nanmean(MarkovAuto.mae)
-    MarkovAuto.smape = smape(test.values, MarkovAuto.forecast)
-    MarkovAuto.overall_smape = np.nanmean(MarkovAuto.smape)
+    try:
+        from statsmodels.tsa.regime_switching.markov_autoregression import MarkovAutoregression
+        startTime = datetime.datetime.now()
+        forecast = pd.DataFrame()
+        for series in train.columns:
+            try:
+                current_series = train[series].copy()
+                current_series = current_series.fillna(method='ffill').fillna(method='bfill')
+                model = MarkovAutoregression(current_series, k_regimes=2, order=4, switching_ar=False).fit()
+                maPred = model.predict(start=testStartDate, end=testEndDate)
+            except Exception:
+                try: # ETS if the above failed
+                    sesModel = SimpleExpSmoothing(current_series).fit()
+                    maPred = sesModel.predict(start=testStartDate, end=testEndDate)
+                except Exception:
+                    maPred = (np.zeros((forecast_length,)))
+            if no_negatives:
+                try:
+                    maPred = pd.Series(np.where(maPred > 0, maPred, 0))
+                except Exception:
+                    maPred = maPred.where(maPred > 0, 0) 
+            forecast = pd.concat([forecast, maPred], axis = 1)
+        MarkovAuto.forecast = forecast.values
+        MarkovAuto.runtime = datetime.datetime.now() - startTime
+        
+        MarkovAuto.mae = pd.DataFrame(mae(test.values, MarkovAuto.forecast)).mean(axis=0, skipna = True)
+        MarkovAuto.overall_mae = np.nanmean(MarkovAuto.mae)
+        MarkovAuto.smape = smape(test.values, MarkovAuto.forecast)
+        MarkovAuto.overall_smape = np.nanmean(MarkovAuto.smape)
+    except Exception as e:
+        print(e)
+        error_list.extend([traceback.format_exc()])
     
     currentResult = pd.DataFrame({
             'method': MarkovAuto.name, 
             'runtime': MarkovAuto.runtime, 
             'overall_smape': MarkovAuto.overall_smape, 
-            'overall_mae': MarkovAuto.overall_mae
+            'overall_mae': MarkovAuto.overall_mae,
+            'object_name': 'MarkovAuto'
             }, index = [0])
     model_results = pd.concat([model_results, currentResult], ignore_index = True).reset_index(drop = True)
     
-    MarkovRegression(dta_kns, k_regimes=3, trend='nc', switching_variance=True)
-    MarkovAutoregression(dta_hamilton, k_regimes=2, order=4, switching_ar=False)
-    """
-    UnComp = ModelResult("UnobservedComponents")
     
+    UnComp = ModelResult("UnobservedComponents")
     try:
         from statsmodels.tsa.statespace.structural import UnobservedComponents
         startTime = datetime.datetime.now()
@@ -394,7 +471,11 @@ def model_evaluator(train, test, subset = 'All'):
                 model = UnobservedComponents(current_series, **unrestricted_model).fit(method='powell')
                 ucPred = model.predict(start=testStartDate, end=testEndDate)
             except Exception:
-                ucPred = (np.zeros((forecast_length,)))
+                try: # ETS if the above failed
+                    sesModel = SimpleExpSmoothing(current_series).fit()
+                    ucPred = sesModel.predict(start=testStartDate, end=testEndDate)
+                except Exception:
+                    ucPred = (np.zeros((forecast_length,)))
             if no_negatives:
                 try:
                     ucPred = pd.Series(np.where(ucPred > 0, ucPred, 0))
@@ -606,7 +687,7 @@ def model_evaluator(train, test, subset = 'All'):
     https://gluon-ts.mxnet.io/
     
     Gluon has a nice built in evaluator, but that is not used here
-    First install mxnet if you haven't already (in my case, pip install mxnet-cu90mkl)
+    First install mxnet if you haven't already (in my case, pip install mxnet-cu90mkl==1.4.1)
     pip install gluonts==0.4.0
     pip install git+https://github.com/awslabs/gluon-ts.git
     pip install numpy==1.17.4 after gluon, because gluon seems okay with new version,
@@ -619,10 +700,13 @@ def model_evaluator(train, test, subset = 'All'):
             from gluonts.dataset.field_names import FieldName # new way
         
         gluon_train = train.fillna(method='ffill').fillna(method='bfill').transpose()
-        
+        if frequency == "MS" or frequency == "1MS":
+            gluon_freq = "1M"
+        else:
+            gluon_freq = frequency
         ts_metadata = {'num_series': len(gluon_train.index),
                               'forecast_length': forecast_length,
-                              'freq': frequency,
+                              'freq': gluon_freq,
                               'gluon_start': [gluon_train.columns[0] for _ in range(len(gluon_train.index))],
                               'context_length': 2 * forecast_length
                              }
@@ -698,7 +782,8 @@ def model_evaluator(train, test, subset = 'All'):
         estimator = DeepAREstimator(freq=ts_metadata['freq'],
                                     context_length=ts_metadata['context_length'],
                                     prediction_length=ts_metadata['forecast_length'] 
-                                    ,trainer=Trainer(epochs=20)
+                                    ,trainer=Trainer(epochs=20,
+                                                     num_batches_per_epoch=200)
                                     )
         
         forecast = pd.DataFrame()
@@ -748,7 +833,7 @@ def model_evaluator(train, test, subset = 'All'):
         estimator = MQCNNEstimator(freq=ts_metadata['freq'],
                                     context_length=ts_metadata['context_length'],
                                     prediction_length=ts_metadata['forecast_length'] 
-                                    ,trainer=Trainer(epochs=20)
+                                    ,trainer=Trainer(epochs=50)
                                     )
         
         forecast = pd.DataFrame()
@@ -841,6 +926,201 @@ def model_evaluator(train, test, subset = 'All'):
     model_results = pd.concat([model_results, currentResult], ignore_index = True).reset_index(drop = True)
     GluonSFF.result_message()
     
+    GluonTransformer = ModelResult("Gluon Transformer")
+    try:
+        startTime = datetime.datetime.now()
+        from gluonts.trainer import Trainer
+        from gluonts.model.transformer import TransformerEstimator
+        estimator = TransformerEstimator(
+            prediction_length=ts_metadata['forecast_length'],
+            context_length=ts_metadata['context_length'],
+            freq=ts_metadata['freq'],
+            trainer=Trainer(epochs=30))
+        forecast = pd.DataFrame()
+        GluonPredictor = estimator.train(test_ds)
+        gluon_results = GluonPredictor.predict(test_ds)
+        i = 0
+        for result in gluon_results:
+            currentCust = gluon_train.index[i]
+            rowForecast = pd.DataFrame({
+                    "ForecastDate": pd.date_range(start = result.start_date, periods = ts_metadata['forecast_length'], freq = ts_metadata['freq']),
+                    "series_id": currentCust,
+                    # "Quantile10thForecast": (result.quantile(0.1)).astype(int),
+                    "MedianForecast": (result.quantile(0.5)).astype(int),
+                    # "Quantile90thForecast": (result.quantile(0.9)).astype(int)
+                    })
+            forecast = pd.concat([forecast, rowForecast], ignore_index = True).reset_index(drop = True)
+            i += 1
+        forecast = forecast.pivot_table(values='MedianForecast', index='ForecastDate', columns='series_id')
+        
+        GluonTransformer.forecast = forecast.values
+        GluonTransformer.runtime = datetime.datetime.now() - startTime
+        
+        GluonTransformer.mae = pd.DataFrame(mae(test.values, GluonTransformer.forecast)).mean(axis=0, skipna = True)
+        GluonTransformer.overall_mae = np.nanmean(GluonTransformer.mae)
+        GluonTransformer.smape = smape(test.values, GluonTransformer.forecast)
+        GluonTransformer.overall_smape = np.nanmean(GluonTransformer.smape)
+    except Exception as e:
+        print(e)
+        error_list.extend([traceback.format_exc()])
+    
+    currentResult = pd.DataFrame({
+            'method': GluonTransformer.name, 
+            'runtime': GluonTransformer.runtime, 
+            'overall_smape': GluonTransformer.overall_smape, 
+            'overall_mae': GluonTransformer.overall_mae,
+            'object_name': 'GluonTransformer'
+            }, index = [0])
+    model_results = pd.concat([model_results, currentResult], ignore_index = True).reset_index(drop = True)
+    GluonTransformer.result_message()
+    
+    GluonDeepState = ModelResult("Gluon DeepState")
+    try:
+        startTime = datetime.datetime.now()
+        from gluonts.trainer import Trainer
+        from gluonts.model.deepstate import DeepStateEstimator
+        estimator = DeepStateEstimator(
+            prediction_length=ts_metadata['forecast_length'],
+            past_length=ts_metadata['context_length'],
+            freq=ts_metadata['freq'],
+            use_feat_static_cat=False,
+            cardinality = [1],
+            trainer=Trainer(ctx='cpu', epochs=20))
+        forecast = pd.DataFrame()
+        GluonPredictor = estimator.train(test_ds)
+        gluon_results = GluonPredictor.predict(test_ds)
+        i = 0
+        for result in gluon_results:
+            currentCust = gluon_train.index[i]
+            rowForecast = pd.DataFrame({
+                    "ForecastDate": pd.date_range(start = result.start_date, periods = ts_metadata['forecast_length'], freq = ts_metadata['freq']),
+                    "series_id": currentCust,
+                    # "Quantile10thForecast": (result.quantile(0.1)).astype(int),
+                    "MedianForecast": (result.quantile(0.5)).astype(int),
+                    # "Quantile90thForecast": (result.quantile(0.9)).astype(int)
+                    })
+            forecast = pd.concat([forecast, rowForecast], ignore_index = True).reset_index(drop = True)
+            i += 1
+        forecast = forecast.pivot_table(values='MedianForecast', index='ForecastDate', columns='series_id')
+        
+        GluonDeepState.forecast = forecast.values
+        GluonDeepState.runtime = datetime.datetime.now() - startTime
+        
+        GluonDeepState.mae = pd.DataFrame(mae(test.values, GluonDeepState.forecast)).mean(axis=0, skipna = True)
+        GluonDeepState.overall_mae = np.nanmean(GluonDeepState.mae)
+        GluonDeepState.smape = smape(test.values, GluonDeepState.forecast)
+        GluonDeepState.overall_smape = np.nanmean(GluonDeepState.smape)
+    except Exception as e:
+        print(e)
+        error_list.extend([traceback.format_exc()])
+    
+    currentResult = pd.DataFrame({
+            'method': GluonDeepState.name, 
+            'runtime': GluonDeepState.runtime, 
+            'overall_smape': GluonDeepState.overall_smape, 
+            'overall_mae': GluonDeepState.overall_mae,
+            'object_name': 'GluonDeepState'
+            }, index = [0])
+    model_results = pd.concat([model_results, currentResult], ignore_index = True).reset_index(drop = True)
+    GluonDeepState.result_message()
+    
+    GluonDeepFactor = ModelResult("Gluon DeepFactor")
+    try:
+        startTime = datetime.datetime.now()
+        from gluonts.trainer import Trainer
+        from gluonts.model.deep_factor import DeepFactorEstimator
+        estimator = DeepFactorEstimator(freq=ts_metadata['freq'],
+                                    context_length=ts_metadata['context_length'],
+                                    prediction_length=ts_metadata['forecast_length'] 
+                                    ,trainer=Trainer(epochs=50)
+                                    )
+        
+        forecast = pd.DataFrame()
+        GluonPredictor = estimator.train(test_ds)
+        gluon_results = GluonPredictor.predict(test_ds)
+        i = 0
+        for result in gluon_results:
+            currentCust = gluon_train.index[i]
+            rowForecast = pd.DataFrame({
+                    "ForecastDate": pd.date_range(start = result.start_date, periods = ts_metadata['forecast_length'], freq = ts_metadata['freq']),
+                    "series_id": currentCust,
+                    # "Quantile10thForecast": (result.quantile(0.1)).astype(int),
+                    "MedianForecast": (result.quantile(0.5)).astype(int),
+                    # "Quantile90thForecast": (result.quantile(0.9)).astype(int)
+                    })
+            forecast = pd.concat([forecast, rowForecast], ignore_index = True).reset_index(drop = True)
+            i += 1
+        forecast = forecast.pivot_table(values='MedianForecast', index='ForecastDate', columns='series_id')
+        
+        GluonDeepFactor.forecast = forecast.values
+        GluonDeepFactor.runtime = datetime.datetime.now() - startTime
+        
+        GluonDeepFactor.mae = pd.DataFrame(mae(test.values, GluonDeepFactor.forecast)).mean(axis=0, skipna = True)
+        GluonDeepFactor.overall_mae = np.nanmean(GluonDeepFactor.mae)
+        GluonDeepFactor.smape = smape(test.values, GluonDeepFactor.forecast)
+        GluonDeepFactor.overall_smape = np.nanmean(GluonDeepFactor.smape)
+    except Exception as e:
+        print(e)
+        error_list.extend([traceback.format_exc()])
+    
+    currentResult = pd.DataFrame({
+            'method': GluonDeepFactor.name, 
+            'runtime': GluonDeepFactor.runtime, 
+            'overall_smape': GluonDeepFactor.overall_smape, 
+            'overall_mae': GluonDeepFactor.overall_mae,
+            'object_name': 'GluonDeepFactor'
+            }, index = [0])
+    model_results = pd.concat([model_results, currentResult], ignore_index = True).reset_index(drop = True)
+    GluonDeepFactor.result_message()
+    
+    GluonWavenet = ModelResult("Gluon Wavenet 150 e")
+    try:
+        startTime = datetime.datetime.now()
+        from gluonts.trainer import Trainer
+        from gluonts.model.wavenet import WaveNetEstimator
+        estimator = WaveNetEstimator(freq=ts_metadata['freq'],
+                                    prediction_length=ts_metadata['forecast_length'] 
+                                    ,trainer=Trainer(epochs=80)
+                                    )
+        
+        forecast = pd.DataFrame()
+        GluonPredictor = estimator.train(test_ds)
+        gluon_results = GluonPredictor.predict(test_ds)
+        i = 0
+        for result in gluon_results:
+            currentCust = gluon_train.index[i]
+            rowForecast = pd.DataFrame({
+                    "ForecastDate": pd.date_range(start = result.start_date, periods = ts_metadata['forecast_length'], freq = ts_metadata['freq']),
+                    "series_id": currentCust,
+                    # "Quantile10thForecast": (result.quantile(0.1)).astype(int),
+                    "MedianForecast": (result.quantile(0.5)).astype(int),
+                    # "Quantile90thForecast": (result.quantile(0.9)).astype(int)
+                    })
+            forecast = pd.concat([forecast, rowForecast], ignore_index = True).reset_index(drop = True)
+            i += 1
+        forecast = forecast.pivot_table(values='MedianForecast', index='ForecastDate', columns='series_id')
+        
+        GluonWavenet.forecast = forecast.values
+        GluonWavenet.runtime = datetime.datetime.now() - startTime
+        
+        GluonWavenet.mae = pd.DataFrame(mae(test.values, GluonWavenet.forecast)).mean(axis=0, skipna = True)
+        GluonWavenet.overall_mae = np.nanmean(GluonWavenet.mae)
+        GluonWavenet.smape = smape(test.values, GluonWavenet.forecast)
+        GluonWavenet.overall_smape = np.nanmean(GluonWavenet.smape)
+    except Exception as e:
+        print(e)
+        error_list.extend([traceback.format_exc()])
+    
+    currentResult = pd.DataFrame({
+            'method': GluonWavenet.name, 
+            'runtime': GluonWavenet.runtime, 
+            'overall_smape': GluonWavenet.overall_smape, 
+            'overall_mae': GluonWavenet.overall_mae,
+            'object_name': 'GluonWavenet'
+            }, index = [0])
+    model_results = pd.concat([model_results, currentResult], ignore_index = True).reset_index(drop = True)
+    GluonWavenet.result_message()
+    
     """
     Simple Ensembles
     """
@@ -849,7 +1129,9 @@ def model_evaluator(train, test, subset = 'All'):
         master_array = np.zeros((test.shape[0], test.shape[1]))
         n = 0
         all_models = [GLM, sETS, ETS, dETS, ProphetResult, ProphetResultHoliday, 
-     AutoArima, SARIMA, UnComp, GluonNPTS, GluonDeepAR, GluonMQCNN, GluonSFF]
+     AutoArima, SARIMA, UnComp, GluonNPTS, GluonDeepAR, GluonMQCNN, GluonSFF,
+     GluonWavenet, GluonDeepFactor, GluonDeepState, GluonTransformer, 
+     MarkovAuto, MarkovReg]
         for modelmethod in all_models:
             if modelmethod.overall_smape != -1:
                 master_array = master_array + modelmethod.forecast
@@ -968,11 +1250,11 @@ def model_evaluator(train, test, subset = 'All'):
     model_results = pd.concat([model_results, currentResult], ignore_index = True).reset_index(drop = True)
     
     
-    GE = ModelResult("GluonDeepAR + ETS")
+    GE = ModelResult("GluonMQCNN + ETS")
     try:
         master_array = np.zeros((test.shape[0], test.shape[1]))
         n = 0
-        ensemble_models = [GluonDeepAR, ETS]
+        ensemble_models = [GluonMQCNN, ETS]
         for modelmethod in ensemble_models:
             if modelmethod.overall_smape != -1:
                 master_array = master_array + modelmethod.forecast
@@ -988,13 +1270,42 @@ def model_evaluator(train, test, subset = 'All'):
     except Exception as e:
         print(e)
         error_list.extend([traceback.format_exc()])
-    
     currentResult = pd.DataFrame({
             'method': GE.name, 
             'runtime': GE.runtime, 
             'overall_smape': GE.overall_smape, 
             'overall_mae': GE.overall_mae,
             'object_name': 'GE'
+            }, index = [0])
+    model_results = pd.concat([model_results, currentResult], ignore_index = True).reset_index(drop = True)
+    
+    GEAR = ModelResult("GluonDeepARE + ETS")
+    try:
+        master_array = np.zeros((test.shape[0], test.shape[1]))
+        n = 0
+        ensemble_models = [GluonMQCNN, ETS]
+        for modelmethod in ensemble_models:
+            if modelmethod.overall_smape != -1:
+                master_array = master_array + modelmethod.forecast
+                n += 1
+    
+        GEAR.forecast = master_array/n
+        GEAR.runtime = datetime.datetime.now() - startTime
+        
+        GEAR.mae = pd.DataFrame(mae(test.values, GEAR.forecast)).mean(axis=0, skipna = True)
+        GEAR.overall_mae = np.nanmean(GEAR.mae)
+        GEAR.smape = smape(test.values, GEAR.forecast)
+        GEAR.overall_smape = np.nanmean(GEAR.smape)
+    except Exception as e:
+        print(e)
+        error_list.extend([traceback.format_exc()])
+    
+    currentResult = pd.DataFrame({
+            'method': GEAR.name, 
+            'runtime': GEAR.runtime, 
+            'overall_smape': GEAR.overall_smape, 
+            'overall_mae': GEAR.overall_mae,
+            'object_name': 'GEAR'
             }, index = [0])
     model_results = pd.concat([model_results, currentResult], ignore_index = True).reset_index(drop = True)
     
@@ -1032,8 +1343,9 @@ def model_evaluator(train, test, subset = 'All'):
     final_result.errors = error_list
     return final_result
 
-evaluator_result = model_evaluator(train, test, subset = 1000)
+evaluator_result = model_evaluator(train, test, subset = series_to_sample)
 eval_table = evaluator_result.model_performance.sort_values('overall_smape', ascending = True)
+eval_table.to_csv("Warehouse12_500of03.csv", index = False)
 print("Complete at: " + str(datetime.datetime.now()))
 
 """
@@ -1048,8 +1360,6 @@ Limit the context length to a standard length?
 Profile metadata of series (number NaN imputed, context length, etc)
 
 Capture volatility of results - basically get methods that do great on many even if they absymally fail on others
-
-Handle failures on series with Try/Except
 
 Forecast distance blending (mix those more accurate in short term and long term) ensemble
 
