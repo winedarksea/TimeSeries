@@ -30,7 +30,7 @@ import pandas as pd
 import datetime
 
 use_sample_data = True # whether to use sample FRED time series or use a new dataset
-fredkey = '93873d40f10c20fe6f6e75b1ad0aed4d' # get from https://research.stlouisfed.org/docs/api/fred/
+fredkey = 'XXXXXXXXXXXXXXXXXXx' # get from https://research.stlouisfed.org/docs/api/fred/
 forecast_length = 90 # how much you will be predicting
 frequency = '1D'  # 'Offset aliases' from https://pandas.pydata.org/pandas-docs/stable/user_guide/timeseries.html
 no_negatives = True # True if all forecasts should be positive
