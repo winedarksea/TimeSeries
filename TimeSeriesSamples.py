@@ -22,6 +22,7 @@ pip install gluonts==0.4.0
 pip install pmdarima==1.4.0 
 pip uninstall numpy # might be necessary, even twice, followed by the following
 pip install numpy==1.17.4 # gluonts likes to force numpy back to 1.14, but 1.17 seems to be fine with it
+pip install sktime==0.3.1
 """
 import traceback
 import numpy as np
@@ -29,22 +30,23 @@ import pandas as pd
 import datetime
 
 use_sample_data = True # whether to use sample FRED time series or use a new dataset
-fredkey = 'xxxxxxxxxxxxxxxxx' # get from https://research.stlouisfed.org/docs/api/fred/
+fredkey = '93873d40f10c20fe6f6e75b1ad0aed4d' # get from https://research.stlouisfed.org/docs/api/fred/
 forecast_length = 90 # how much you will be predicting
 frequency = '1D'  # 'Offset aliases' from https://pandas.pydata.org/pandas-docs/stable/user_guide/timeseries.html
 no_negatives = True # True if all forecasts should be positive
 series_to_sample = 50 # number of series to evaluate on
-na_tolerance = 0.3 # 0 to 1, drop time series if up to this percent of values are na
+na_tolerance = 0.15 # 0 to 1, drop time series if up to this percent of values are NOT NaN
 drop_most_recent = False # if to drop the most recent date and value (useful if most recent is incomplete month, say)
 figures = False # whether to plot some sample time series
 drop_data_older_than_years = 5 # at what point to cut old data
 fill_na_zero = False # use for intermittent time series, where NA just means zero (sales, say)
+output_name = "eval_table.csv"
 
 # import and modify dataset to have date/series_id/value columns
 if not use_sample_data:
-    timeseries_long = pd.read_csv("MonthlyWarehouseProductSales.csv")
-    timeseries_long['series_id'] = timeseries_long['WarehouseID'] + '|' + timeseries_long['ProductID']
-    timeseries_long['value'] = timeseries_long['UnitSales']
+    timeseries_long = pd.read_csv("CustMonthlySales.csv")
+    timeseries_long['series_id'] = timeseries_long['CustomerKey']
+    timeseries_long['value'] = timeseries_long['TotalSales']
     timeseries_long['date'] = pd.to_datetime(timeseries_long['MonthDateKey'], format = '%Y%m%d')
     timeseries_long = timeseries_long[['date','series_id','value']]
 
@@ -183,7 +185,7 @@ test = timeseries_seriescols.tail(forecast_length)
 
 
 class ModelResult(object):
-    def __init__(self, name=None, forecast=None, mae=None, overall_mae=-1, smape=None, overall_smape=-1, runtime=-1):
+    def __init__(self, name=None, forecast=None, mae=None, overall_mae=-1, smape=None, overall_smape=-1, runtime=datetime.timedelta(0)):
         self.name = name
         self.forecast = forecast
         self.mae = mae
@@ -230,8 +232,10 @@ def model_evaluator(train, test, subset = 'All'):
     try:
         from statsmodels.regression.linear_model import GLS
         startTime = datetime.datetime.now()
-        glm_model = GLS(train.values, (train.index.astype(int).values), missing = 'drop').fit()
-        GLM.forecast = glm_model.predict(test.index.astype(int).values)
+        glm_model = GLS(train.values, (train.index.values), missing = 'drop').fit()
+        GLM.forecast = glm_model.predict(test.index.values)
+        if no_negatives:
+            GLM.forecast = GLM.forecast.clip(min = 0)
         GLM.runtime = datetime.datetime.now() - startTime
         
         GLM.mae = pd.DataFrame(mae(test.values, GLM.forecast)).mean(axis=0, skipna = True)
@@ -424,11 +428,7 @@ def model_evaluator(train, test, subset = 'All'):
                 model = MarkovAutoregression(current_series, k_regimes=2, order=4, switching_ar=False).fit()
                 maPred = model.predict(start=testStartDate, end=testEndDate)
             except Exception:
-                try: # ETS if the above failed
-                    sesModel = SimpleExpSmoothing(current_series).fit()
-                    maPred = sesModel.predict(start=testStartDate, end=testEndDate)
-                except Exception:
-                    maPred = (np.zeros((forecast_length,)))
+                maPred = (np.zeros((forecast_length,)))
             if no_negatives:
                 try:
                     maPred = pd.Series(np.where(maPred > 0, maPred, 0))
@@ -744,14 +744,16 @@ def model_evaluator(train, test, subset = 'All'):
             rowForecast = pd.DataFrame({
                     "ForecastDate": pd.date_range(start = result.start_date, periods = ts_metadata['forecast_length'], freq = ts_metadata['freq']),
                     "series_id": currentCust,
-                    # "Quantile10thForecast": (result.quantile(0.1)).astype(int),
-                    "MedianForecast": (result.quantile(0.5)).astype(int),
-                    # "Quantile90thForecast": (result.quantile(0.9)).astype(int)
+                    # "Quantile10thForecast": (result.quantile(0.1)),
+                    "MedianForecast": (result.quantile(0.5)),
+                    # "Quantile90thForecast": (result.quantile(0.9))
                     })
+            if no_negatives:
+                rowForecast['MedianForecast'] = rowForecast['MedianForecast'].clip(lower = 0)
             forecast = pd.concat([forecast, rowForecast], ignore_index = True).reset_index(drop = True)
             i += 1
         forecast = forecast.pivot_table(values='MedianForecast', index='ForecastDate', columns='series_id')
-        
+        forecast = forecast[test.columns]
         GluonNPTS.forecast = forecast.values
         GluonNPTS.runtime = datetime.datetime.now() - startTime
         
@@ -795,13 +797,16 @@ def model_evaluator(train, test, subset = 'All'):
             rowForecast = pd.DataFrame({
                     "ForecastDate": pd.date_range(start = result.start_date, periods = ts_metadata['forecast_length'], freq = ts_metadata['freq']),
                     "series_id": currentCust,
-                    # "Quantile10thForecast": (result.quantile(0.1)).astype(int),
-                    "MedianForecast": (result.quantile(0.5)).astype(int),
-                    # "Quantile90thForecast": (result.quantile(0.9)).astype(int)
+                    # "Quantile10thForecast": (result.quantile(0.1)),
+                    "MedianForecast": (result.quantile(0.5)),
+                    # "Quantile90thForecast": (result.quantile(0.9))
                     })
+            if no_negatives:
+                rowForecast['MedianForecast'] = rowForecast['MedianForecast'].clip(lower = 0)
             forecast = pd.concat([forecast, rowForecast], ignore_index = True).reset_index(drop = True)
             i += 1
         forecast = forecast.pivot_table(values='MedianForecast', index='ForecastDate', columns='series_id')
+        forecast = forecast[test.columns]
         
         GluonDeepAR.forecast = forecast.values
         GluonDeepAR.runtime = datetime.datetime.now() - startTime
@@ -845,13 +850,16 @@ def model_evaluator(train, test, subset = 'All'):
             rowForecast = pd.DataFrame({
                     "ForecastDate": pd.date_range(start = result.start_date, periods = ts_metadata['forecast_length'], freq = ts_metadata['freq']),
                     "series_id": currentCust,
-                    # "Quantile10thForecast": (result.quantile(0.1)).astype(int),
-                    "MedianForecast": (result.quantile(0.5)).astype(int),
-                    # "Quantile90thForecast": (result.quantile(0.9)).astype(int)
+                    # "Quantile10thForecast": (result.quantile(0.1)),
+                    "MedianForecast": (result.quantile(0.5)),
+                    # "Quantile90thForecast": (result.quantile(0.9))
                     })
+            if no_negatives:
+                rowForecast['MedianForecast'] = rowForecast['MedianForecast'].clip(lower = 0)
             forecast = pd.concat([forecast, rowForecast], ignore_index = True).reset_index(drop = True)
             i += 1
         forecast = forecast.pivot_table(values='MedianForecast', index='ForecastDate', columns='series_id')
+        forecast = forecast[test.columns]
         
         GluonMQCNN.forecast = forecast.values
         GluonMQCNN.runtime = datetime.datetime.now() - startTime
@@ -897,13 +905,16 @@ def model_evaluator(train, test, subset = 'All'):
             rowForecast = pd.DataFrame({
                     "ForecastDate": pd.date_range(start = result.start_date, periods = ts_metadata['forecast_length'], freq = ts_metadata['freq']),
                     "series_id": currentCust,
-                    # "Quantile10thForecast": (result.quantile(0.1)).astype(int),
-                    "MedianForecast": (result.quantile(0.5)).astype(int),
-                    # "Quantile90thForecast": (result.quantile(0.9)).astype(int)
+                    # "Quantile10thForecast": (result.quantile(0.1)),
+                    "MedianForecast": (result.quantile(0.5)),
+                    # "Quantile90thForecast": (result.quantile(0.9))
                     })
+            if no_negatives:
+                rowForecast['MedianForecast'] = rowForecast['MedianForecast'].clip(lower = 0)
             forecast = pd.concat([forecast, rowForecast], ignore_index = True).reset_index(drop = True)
             i += 1
         forecast = forecast.pivot_table(values='MedianForecast', index='ForecastDate', columns='series_id')
+        forecast = forecast[test.columns]
         
         GluonSFF.forecast = forecast.values
         GluonSFF.runtime = datetime.datetime.now() - startTime
@@ -926,7 +937,7 @@ def model_evaluator(train, test, subset = 'All'):
     model_results = pd.concat([model_results, currentResult], ignore_index = True).reset_index(drop = True)
     GluonSFF.result_message()
     
-    GluonTransformer = ModelResult("Gluon Transformer")
+    GluonTransformer = ModelResult("Gluon Transformer 20 epoch")
     try:
         startTime = datetime.datetime.now()
         from gluonts.trainer import Trainer
@@ -935,7 +946,7 @@ def model_evaluator(train, test, subset = 'All'):
             prediction_length=ts_metadata['forecast_length'],
             context_length=ts_metadata['context_length'],
             freq=ts_metadata['freq'],
-            trainer=Trainer(epochs=30))
+            trainer=Trainer(epochs=20))
         forecast = pd.DataFrame()
         GluonPredictor = estimator.train(test_ds)
         gluon_results = GluonPredictor.predict(test_ds)
@@ -945,13 +956,16 @@ def model_evaluator(train, test, subset = 'All'):
             rowForecast = pd.DataFrame({
                     "ForecastDate": pd.date_range(start = result.start_date, periods = ts_metadata['forecast_length'], freq = ts_metadata['freq']),
                     "series_id": currentCust,
-                    # "Quantile10thForecast": (result.quantile(0.1)).astype(int),
-                    "MedianForecast": (result.quantile(0.5)).astype(int),
-                    # "Quantile90thForecast": (result.quantile(0.9)).astype(int)
+                    # "Quantile10thForecast": (result.quantile(0.1)),
+                    "MedianForecast": (result.quantile(0.5)),
+                    # "Quantile90thForecast": (result.quantile(0.9))
                     })
+            if no_negatives:
+                rowForecast['MedianForecast'] = rowForecast['MedianForecast'].clip(lower = 0)
             forecast = pd.concat([forecast, rowForecast], ignore_index = True).reset_index(drop = True)
             i += 1
         forecast = forecast.pivot_table(values='MedianForecast', index='ForecastDate', columns='series_id')
+        forecast = forecast[test.columns]
         
         GluonTransformer.forecast = forecast.values
         GluonTransformer.runtime = datetime.datetime.now() - startTime
@@ -963,7 +977,6 @@ def model_evaluator(train, test, subset = 'All'):
     except Exception as e:
         print(e)
         error_list.extend([traceback.format_exc()])
-    
     currentResult = pd.DataFrame({
             'method': GluonTransformer.name, 
             'runtime': GluonTransformer.runtime, 
@@ -973,6 +986,57 @@ def model_evaluator(train, test, subset = 'All'):
             }, index = [0])
     model_results = pd.concat([model_results, currentResult], ignore_index = True).reset_index(drop = True)
     GluonTransformer.result_message()
+    
+    GluonTransformer150 = ModelResult("Gluon Transformer 150 epoch")
+    try:
+        startTime = datetime.datetime.now()
+        from gluonts.trainer import Trainer
+        from gluonts.model.transformer import TransformerEstimator
+        estimator = TransformerEstimator(
+            prediction_length=ts_metadata['forecast_length'],
+            context_length=ts_metadata['context_length'],
+            freq=ts_metadata['freq'],
+            trainer=Trainer(epochs=150))
+        forecast = pd.DataFrame()
+        GluonPredictor = estimator.train(test_ds)
+        gluon_results = GluonPredictor.predict(test_ds)
+        i = 0
+        for result in gluon_results:
+            currentCust = gluon_train.index[i]
+            rowForecast = pd.DataFrame({
+                    "ForecastDate": pd.date_range(start = result.start_date, periods = ts_metadata['forecast_length'], freq = ts_metadata['freq']),
+                    "series_id": currentCust,
+                    # "Quantile10thForecast": (result.quantile(0.1)),
+                    "MedianForecast": (result.quantile(0.5)),
+                    # "Quantile90thForecast": (result.quantile(0.9))
+                    })
+            if no_negatives:
+                rowForecast['MedianForecast'] = rowForecast['MedianForecast'].clip(lower = 0)
+            forecast = pd.concat([forecast, rowForecast], ignore_index = True).reset_index(drop = True)
+            i += 1
+        forecast = forecast.pivot_table(values='MedianForecast', index='ForecastDate', columns='series_id')
+        forecast = forecast[test.columns]
+        
+        GluonTransformer150.forecast = forecast.values
+        GluonTransformer150.runtime = datetime.datetime.now() - startTime
+        
+        GluonTransformer150.mae = pd.DataFrame(mae(test.values, GluonTransformer150.forecast)).mean(axis=0, skipna = True)
+        GluonTransformer150.overall_mae = np.nanmean(GluonTransformer150.mae)
+        GluonTransformer150.smape = smape(test.values, GluonTransformer150.forecast)
+        GluonTransformer150.overall_smape = np.nanmean(GluonTransformer150.smape)
+    except Exception as e:
+        print(e)
+        error_list.extend([traceback.format_exc()])
+    
+    currentResult = pd.DataFrame({
+            'method': GluonTransformer150.name, 
+            'runtime': GluonTransformer150.runtime, 
+            'overall_smape': GluonTransformer150.overall_smape, 
+            'overall_mae': GluonTransformer150.overall_mae,
+            'object_name': 'GluonTransformer150'
+            }, index = [0])
+    model_results = pd.concat([model_results, currentResult], ignore_index = True).reset_index(drop = True)
+    GluonTransformer150.result_message()
     
     GluonDeepState = ModelResult("Gluon DeepState")
     try:
@@ -995,13 +1059,16 @@ def model_evaluator(train, test, subset = 'All'):
             rowForecast = pd.DataFrame({
                     "ForecastDate": pd.date_range(start = result.start_date, periods = ts_metadata['forecast_length'], freq = ts_metadata['freq']),
                     "series_id": currentCust,
-                    # "Quantile10thForecast": (result.quantile(0.1)).astype(int),
-                    "MedianForecast": (result.quantile(0.5)).astype(int),
-                    # "Quantile90thForecast": (result.quantile(0.9)).astype(int)
+                    # "Quantile10thForecast": (result.quantile(0.1)),
+                    "MedianForecast": (result.quantile(0.5)),
+                    # "Quantile90thForecast": (result.quantile(0.9))
                     })
+            if no_negatives:
+                rowForecast['MedianForecast'] = rowForecast['MedianForecast'].clip(lower = 0)
             forecast = pd.concat([forecast, rowForecast], ignore_index = True).reset_index(drop = True)
             i += 1
         forecast = forecast.pivot_table(values='MedianForecast', index='ForecastDate', columns='series_id')
+        forecast = forecast[test.columns]
         
         GluonDeepState.forecast = forecast.values
         GluonDeepState.runtime = datetime.datetime.now() - startTime
@@ -1044,13 +1111,16 @@ def model_evaluator(train, test, subset = 'All'):
             rowForecast = pd.DataFrame({
                     "ForecastDate": pd.date_range(start = result.start_date, periods = ts_metadata['forecast_length'], freq = ts_metadata['freq']),
                     "series_id": currentCust,
-                    # "Quantile10thForecast": (result.quantile(0.1)).astype(int),
-                    "MedianForecast": (result.quantile(0.5)).astype(int),
-                    # "Quantile90thForecast": (result.quantile(0.9)).astype(int)
+                    # "Quantile10thForecast": (result.quantile(0.1)),
+                    "MedianForecast": (result.quantile(0.5)),
+                    # "Quantile90thForecast": (result.quantile(0.9))
                     })
+            if no_negatives:
+                rowForecast['MedianForecast'] = rowForecast['MedianForecast'].clip(lower = 0)
             forecast = pd.concat([forecast, rowForecast], ignore_index = True).reset_index(drop = True)
             i += 1
         forecast = forecast.pivot_table(values='MedianForecast', index='ForecastDate', columns='series_id')
+        forecast = forecast[test.columns]
         
         GluonDeepFactor.forecast = forecast.values
         GluonDeepFactor.runtime = datetime.datetime.now() - startTime
@@ -1073,7 +1143,7 @@ def model_evaluator(train, test, subset = 'All'):
     model_results = pd.concat([model_results, currentResult], ignore_index = True).reset_index(drop = True)
     GluonDeepFactor.result_message()
     
-    GluonWavenet = ModelResult("Gluon Wavenet 150 e")
+    GluonWavenet = ModelResult("Gluon Wavenet")
     try:
         startTime = datetime.datetime.now()
         from gluonts.trainer import Trainer
@@ -1092,13 +1162,16 @@ def model_evaluator(train, test, subset = 'All'):
             rowForecast = pd.DataFrame({
                     "ForecastDate": pd.date_range(start = result.start_date, periods = ts_metadata['forecast_length'], freq = ts_metadata['freq']),
                     "series_id": currentCust,
-                    # "Quantile10thForecast": (result.quantile(0.1)).astype(int),
-                    "MedianForecast": (result.quantile(0.5)).astype(int),
-                    # "Quantile90thForecast": (result.quantile(0.9)).astype(int)
+                    # "Quantile10thForecast": (result.quantile(0.1)),
+                    "MedianForecast": (result.quantile(0.5)),
+                    # "Quantile90thForecast": (result.quantile(0.9))
                     })
+            if no_negatives:
+                rowForecast['MedianForecast'] = rowForecast['MedianForecast'].clip(lower = 0)
             forecast = pd.concat([forecast, rowForecast], ignore_index = True).reset_index(drop = True)
             i += 1
         forecast = forecast.pivot_table(values='MedianForecast', index='ForecastDate', columns='series_id')
+        forecast = forecast[test.columns]
         
         GluonWavenet.forecast = forecast.values
         GluonWavenet.runtime = datetime.datetime.now() - startTime
@@ -1120,6 +1193,206 @@ def model_evaluator(train, test, subset = 'All'):
             }, index = [0])
     model_results = pd.concat([model_results, currentResult], ignore_index = True).reset_index(drop = True)
     GluonWavenet.result_message()
+        
+    SktimeKNN = ModelResult("Sktime KNN")
+    try:
+        from sktime.transformers.compose import Tabulariser
+        from sklearn.neighbors import KNeighborsRegressor
+        from sktime.pipeline import Pipeline
+        from sktime.highlevel.tasks import ForecastingTask
+        from sktime.highlevel.strategies import Forecasting2TSRReductionStrategy
+        startTime = datetime.datetime.now()
+        forecast = pd.DataFrame()
+        fh_vals = [x + 1 for x in range(forecast_length)]
+        for series in train.columns:
+            current_series = train[series].copy()
+            current_series = current_series.fillna(method='ffill').fillna(method='bfill')
+            current_series_df = pd.DataFrame(pd.Series([current_series.reset_index(drop = True)]), columns = ['outcome'])
+            steps = [
+                ('tabularise', Tabulariser()),
+                ('clf', KNeighborsRegressor() ) # RandomForestRegressor(n_estimators=10))
+            ]
+            estimator = Pipeline(steps)
+            
+            task = ForecastingTask(target='outcome', fh= fh_vals,
+                                   metadata=current_series_df)
+            
+            s = Forecasting2TSRReductionStrategy(estimator=estimator)
+            s.fit(task, current_series_df)
+            srfPred = s.predict().values
+            if no_negatives:
+                try:
+                    srfPred = pd.Series(np.where(srfPred > 0, srfPred, 0))
+                except Exception:
+                    srfPred = srfPred.where(srfPred > 0, 0) 
+    
+            forecast = pd.concat([forecast, srfPred], axis = 1)
+        SktimeKNN.forecast = forecast.values
+        SktimeKNN.runtime = datetime.datetime.now() - startTime
+        
+        SktimeKNN.mae = pd.DataFrame(mae(test.values, SktimeKNN.forecast)).mean(axis=0, skipna = True)
+        SktimeKNN.overall_mae = np.nanmean(SktimeKNN.mae)
+        SktimeKNN.smape = smape(test.values, SktimeKNN.forecast)
+        SktimeKNN.overall_smape = np.nanmean(SktimeKNN.smape)
+    except Exception as e:
+        print(e)
+        error_list.extend([traceback.format_exc()])
+    
+    currentResult = pd.DataFrame({
+            'method': SktimeKNN.name, 
+            'runtime': SktimeKNN.runtime, 
+            'overall_smape': SktimeKNN.overall_smape, 
+            'overall_mae': SktimeKNN.overall_mae,
+            'object_name': 'SktimeKNN'
+            }, index = [0])
+    model_results = pd.concat([model_results, currentResult], ignore_index = True).reset_index(drop = True)
+    SktimeKNN.result_message()
+
+    SktimeAda = ModelResult("Sktime Adaboost 10 Estimators")
+    try:
+        from sktime.transformers.compose import Tabulariser
+        from sklearn.ensemble import AdaBoostRegressor
+        from sktime.pipeline import Pipeline
+        from sktime.highlevel.tasks import ForecastingTask
+        from sktime.highlevel.strategies import Forecasting2TSRReductionStrategy
+        startTime = datetime.datetime.now()
+        forecast = pd.DataFrame()
+        fh_vals = [x + 1 for x in range(forecast_length)]
+        for series in train.columns:
+            current_series = train[series].copy()
+            current_series = current_series.fillna(method='ffill').fillna(method='bfill')
+            current_series_df = pd.DataFrame(pd.Series([current_series.reset_index(drop = True)]), columns = ['outcome'])
+            steps = [
+                ('tabularise', Tabulariser()),
+                ('clf', AdaBoostRegressor(n_estimators=10) ) # RandomForestRegressor(n_estimators=10))
+            ]
+            estimator = Pipeline(steps)
+            
+            task = ForecastingTask(target='outcome', fh= fh_vals,
+                                   metadata=current_series_df)
+            
+            s = Forecasting2TSRReductionStrategy(estimator=estimator)
+            s.fit(task, current_series_df)
+            srfPred = s.predict().values
+            if no_negatives:
+                try:
+                    srfPred = pd.Series(np.where(srfPred > 0, srfPred, 0))
+                except Exception:
+                    srfPred = srfPred.where(srfPred > 0, 0) 
+    
+            forecast = pd.concat([forecast, srfPred], axis = 1)
+        SktimeAda.forecast = forecast.values
+        SktimeAda.runtime = datetime.datetime.now() - startTime
+        
+        SktimeAda.mae = pd.DataFrame(mae(test.values, SktimeAda.forecast)).mean(axis=0, skipna = True)
+        SktimeAda.overall_mae = np.nanmean(SktimeAda.mae)
+        SktimeAda.smape = smape(test.values, SktimeAda.forecast)
+        SktimeAda.overall_smape = np.nanmean(SktimeAda.smape)
+    except Exception as e:
+        print(e)
+        error_list.extend([traceback.format_exc()])
+    
+    currentResult = pd.DataFrame({
+            'method': SktimeAda.name, 
+            'runtime': SktimeAda.runtime, 
+            'overall_smape': SktimeAda.overall_smape, 
+            'overall_mae': SktimeAda.overall_mae,
+            'object_name': 'SktimeAda'
+            }, index = [0])
+    model_results = pd.concat([model_results, currentResult], ignore_index = True).reset_index(drop = True)
+    SktimeAda.result_message()
+    
+    RandForest = ModelResult("Random Forest Lag 1")
+    try:
+        from sktime.transformers.compose import Tabulariser
+        from sklearn.ensemble import RandomForestRegressor
+        from sktime.pipeline import Pipeline
+        from sktime.highlevel.tasks import ForecastingTask
+        from sktime.highlevel.strategies import Forecasting2TSRReductionStrategy
+        startTime = datetime.datetime.now()
+        sktraindata = train.dropna(how = 'all', axis = 0).fillna(method='ffill').fillna(method='bfill')
+        Y = sktraindata.drop(sktraindata.head(1).index)
+        X = sktraindata.drop(sktraindata.tail(1).index)
+        
+        regr = RandomForestRegressor(random_state=425, n_estimators=100)
+        regr.fit(X, Y) 
+        
+        forecast = regr.predict(sktraindata.tail(1).values)
+        for x in range(forecast_length - 1):
+            rfPred = regr.predict(forecast[-1, :].reshape(1, -1))
+            if no_negatives:
+                rfPred[rfPred < 0] = 0
+            forecast = np.append(forecast, rfPred, axis = 0)
+        RandForest.forecast = forecast
+        RandForest.runtime = datetime.datetime.now() - startTime
+        
+        RandForest.mae = pd.DataFrame(mae(test.values, RandForest.forecast)).mean(axis=0, skipna = True)
+        RandForest.overall_mae = np.nanmean(RandForest.mae)
+        RandForest.smape = smape(test.values, RandForest.forecast)
+        RandForest.overall_smape = np.nanmean(RandForest.smape)
+        del(sktraindata)
+    except Exception as e:
+        print(e)
+        error_list.extend([traceback.format_exc()])
+    
+    currentResult = pd.DataFrame({
+            'method': RandForest.name, 
+            'runtime': RandForest.runtime, 
+            'overall_smape': RandForest.overall_smape, 
+            'overall_mae': RandForest.overall_mae,
+            'object_name': 'RandForest'
+            }, index = [0])
+    model_results = pd.concat([model_results, currentResult], ignore_index = True).reset_index(drop = True)
+    RandForest.result_message()
+    
+    RandFeaturedForest = ModelResult("Random Forest Lag 1, Roll 7 std, Roll 30 mean")
+    try:
+        from sklearn.ensemble import RandomForestRegressor
+        startTime = datetime.datetime.now()
+        sktraindata = train.dropna(how = 'all', axis = 0).fillna(method='ffill').fillna(method='bfill')
+        Y = sktraindata.drop(sktraindata.head(2).index) 
+        Y.columns = [x for x in range(len(Y.columns))]
+       
+        def X_maker(df):
+            X = pd.concat([df, df.rolling(30,min_periods = 1).mean(), df.rolling(7,min_periods = 1).std()], axis = 1)
+            X.columns = [x for x in range(len(X.columns))]
+            X.replace([np.inf, -np.inf], np.nan).fillna(method='ffill').fillna(method='bfill')
+            return X
+        X = X_maker(sktraindata)
+        X = X.drop(X.tail(1).index).drop(X.head(1).index)
+     
+        regr = RandomForestRegressor(random_state=425, n_estimators=100)
+        regr.fit(X, Y)
+        
+        forecast = pd.DataFrame()
+        sktraindata.columns = [x for x in range(len(sktraindata.columns))]
+        for x in range(forecast_length):
+            rfPred =  pd.DataFrame(regr.predict(X_maker(sktraindata).tail(1).values))
+            if no_negatives:
+                rfPred[rfPred < 0] = 0
+            forecast = pd.concat([forecast, rfPred], axis = 0, ignore_index = True)
+            sktraindata = pd.concat([sktraindata, rfPred], axis = 0, ignore_index = True)
+        RandFeaturedForest.forecast = forecast.values
+        RandFeaturedForest.runtime = datetime.datetime.now() - startTime
+       
+        RandFeaturedForest.mae = pd.DataFrame(mae(test.values, RandFeaturedForest.forecast)).mean(axis=0, skipna = True)
+        RandFeaturedForest.overall_mae = np.nanmean(RandFeaturedForest.mae)
+        RandFeaturedForest.smape = smape(test.values, RandFeaturedForest.forecast)
+        RandFeaturedForest.overall_smape = np.nanmean(RandFeaturedForest.smape)
+        del(sktraindata)
+    except Exception as e:
+        print(e)
+        error_list.extend([traceback.format_exc()])
+     
+    currentResult = pd.DataFrame({
+            'method': RandFeaturedForest.name,
+            'runtime': RandFeaturedForest.runtime,
+            'overall_smape': RandFeaturedForest.overall_smape,
+            'overall_mae': RandFeaturedForest.overall_mae,
+            'object_name': 'RandFeaturedForest'
+            }, index = [0])
+    model_results = pd.concat([model_results, currentResult], ignore_index = True).reset_index(drop = True)
+    RandFeaturedForest.result_message()
     
     """
     Simple Ensembles
@@ -1128,17 +1401,19 @@ def model_evaluator(train, test, subset = 'All'):
     try:
         master_array = np.zeros((test.shape[0], test.shape[1]))
         n = 0
+        runtime = datetime.timedelta(0)
         all_models = [GLM, sETS, ETS, dETS, ProphetResult, ProphetResultHoliday, 
      AutoArima, SARIMA, UnComp, GluonNPTS, GluonDeepAR, GluonMQCNN, GluonSFF,
      GluonWavenet, GluonDeepFactor, GluonDeepState, GluonTransformer, 
-     MarkovAuto, MarkovReg]
+     MarkovAuto, MarkovReg, SktimeKNN, SktimeAda, RandFeaturedForest, RandForest]
         for modelmethod in all_models:
             if modelmethod.overall_smape != -1:
                 master_array = master_array + modelmethod.forecast
+                runtime = runtime + modelmethod.runtime
                 n += 1
     
         AllModelEnsemble.forecast = master_array/n
-        AllModelEnsemble.runtime = datetime.datetime.now() - startTime
+        AllModelEnsemble.runtime = runtime
         
         AllModelEnsemble.mae = pd.DataFrame(mae(test.values, AllModelEnsemble.forecast)).mean(axis=0, skipna = True)
         AllModelEnsemble.overall_mae = np.nanmean(AllModelEnsemble.mae)
@@ -1161,14 +1436,16 @@ def model_evaluator(train, test, subset = 'All'):
     try:
         master_array = np.zeros((test.shape[0], test.shape[1]))
         n = 0
+        runtime = datetime.timedelta(0)
         ensemble_models = [sETS, ETS, dETS]
         for modelmethod in ensemble_models:
             if modelmethod.overall_smape != -1:
                 master_array = master_array + modelmethod.forecast
+                runtime = runtime + modelmethod.runtime
                 n += 1
     
         M4.forecast = master_array/n
-        M4.runtime = datetime.datetime.now() - startTime
+        M4.runtime = runtime
         
         M4.mae = pd.DataFrame(mae(test.values, M4.forecast)).mean(axis=0, skipna = True)
         M4.overall_mae = np.nanmean(M4.mae)
@@ -1193,14 +1470,16 @@ def model_evaluator(train, test, subset = 'All'):
         
         bestNames = model_results[model_results['overall_smape'] > 0].sort_values('overall_smape', ascending = True).head(3)['object_name'].values
         n = 0
+        runtime = datetime.timedelta(0)
         for modelmethod in bestNames:
             modelmethod_obj = eval(modelmethod) # globals()[modelmethod] # getattr(sys.modules[__name__], modelmethod)
             if modelmethod_obj.overall_smape != -1:
                 master_array = master_array + modelmethod_obj.forecast
                 n += 1
+                runtime = runtime + modelmethod_obj.runtime
     
         bestN.forecast = master_array/n
-        bestN.runtime = datetime.datetime.now() - startTime
+        bestN.runtime = runtime
         
         bestN.mae = pd.DataFrame(mae(test.values, bestN.forecast)).mean(axis=0, skipna = True)
         bestN.overall_mae = np.nanmean(bestN.mae)
@@ -1223,14 +1502,16 @@ def model_evaluator(train, test, subset = 'All'):
     try:
         master_array = np.zeros((test.shape[0], test.shape[1]))
         n = 0
+        runtime = datetime.timedelta(0)
         ensemble_models = [AutoArima, ETS, ProphetResult]
         for modelmethod in ensemble_models:
             if modelmethod.overall_smape != -1:
                 master_array = master_array + modelmethod.forecast
+                runtime = runtime + modelmethod.runtime
                 n += 1
     
         EPA.forecast = master_array/n
-        EPA.runtime = datetime.datetime.now() - startTime
+        EPA.runtime = runtime
         
         EPA.mae = pd.DataFrame(mae(test.values, EPA.forecast)).mean(axis=0, skipna = True)
         EPA.overall_mae = np.nanmean(EPA.mae)
@@ -1255,13 +1536,15 @@ def model_evaluator(train, test, subset = 'All'):
         master_array = np.zeros((test.shape[0], test.shape[1]))
         n = 0
         ensemble_models = [GluonMQCNN, ETS]
+        runtime = datetime.timedelta(0)
         for modelmethod in ensemble_models:
             if modelmethod.overall_smape != -1:
                 master_array = master_array + modelmethod.forecast
+                runtime = runtime + modelmethod.runtime
                 n += 1
     
         GE.forecast = master_array/n
-        GE.runtime = datetime.datetime.now() - startTime
+        GE.runtime = runtime
         
         GE.mae = pd.DataFrame(mae(test.values, GE.forecast)).mean(axis=0, skipna = True)
         GE.overall_mae = np.nanmean(GE.mae)
@@ -1283,14 +1566,16 @@ def model_evaluator(train, test, subset = 'All'):
     try:
         master_array = np.zeros((test.shape[0], test.shape[1]))
         n = 0
+        runtime = datetime.timedelta(0)
         ensemble_models = [GluonMQCNN, ETS]
         for modelmethod in ensemble_models:
             if modelmethod.overall_smape != -1:
                 master_array = master_array + modelmethod.forecast
+                runtime = runtime + modelmethod.runtime
                 n += 1
     
         GEAR.forecast = master_array/n
-        GEAR.runtime = datetime.datetime.now() - startTime
+        GEAR.runtime = runtime
         
         GEAR.mae = pd.DataFrame(mae(test.values, GEAR.forecast)).mean(axis=0, skipna = True)
         GEAR.overall_mae = np.nanmean(GEAR.mae)
@@ -1308,6 +1593,71 @@ def model_evaluator(train, test, subset = 'All'):
             'object_name': 'GEAR'
             }, index = [0])
     model_results = pd.concat([model_results, currentResult], ignore_index = True).reset_index(drop = True)
+    
+    RAETS = ModelResult("ETS + Random Forest")
+    try:
+        master_array = np.zeros((test.shape[0], test.shape[1]))
+        n = 0
+        runtime = datetime.timedelta(0)
+        all_models = [ETS, RandForest]
+        for modelmethod in all_models:
+            if modelmethod.overall_smape != -1:
+                master_array = master_array + modelmethod.forecast
+                runtime = runtime + modelmethod.runtime
+                n += 1
+    
+        RAETS.forecast = master_array/n
+        RAETS.runtime = runtime
+        
+        RAETS.mae = pd.DataFrame(mae(test.values, RAETS.forecast)).mean(axis=0, skipna = True)
+        RAETS.overall_mae = np.nanmean(RAETS.mae)
+        RAETS.smape = smape(test.values, RAETS.forecast)
+        RAETS.overall_smape = np.nanmean(RAETS.smape)
+    except Exception as e:
+        print(e)
+        error_list.extend([traceback.format_exc()])
+    
+    currentResult = pd.DataFrame({
+            'method': RAETS.name, 
+            'runtime': RAETS.runtime, 
+            'overall_smape': RAETS.overall_smape, 
+            'overall_mae': RAETS.overall_mae,
+            'object_name': 'RAETS'
+            }, index = [0])
+    model_results = pd.concat([model_results, currentResult], ignore_index = True).reset_index(drop = True)
+    
+    RATKN = ModelResult("SktimeKNN + Random Forest")
+    try:
+        master_array = np.zeros((test.shape[0], test.shape[1]))
+        n = 0
+        runtime = datetime.timedelta(0)
+        all_models = [SktimeKNN, RandForest]
+        for modelmethod in all_models:
+            if modelmethod.overall_smape != -1:
+                master_array = master_array + modelmethod.forecast
+                runtime = runtime + modelmethod.runtime
+                n += 1
+    
+        RATKN.forecast = master_array/n
+        RATKN.runtime = runtime
+        
+        RATKN.mae = pd.DataFrame(mae(test.values, RATKN.forecast)).mean(axis=0, skipna = True)
+        RATKN.overall_mae = np.nanmean(RATKN.mae)
+        RATKN.smape = smape(test.values, RATKN.forecast)
+        RATKN.overall_smape = np.nanmean(RATKN.smape)
+    except Exception as e:
+        print(e)
+        error_list.extend([traceback.format_exc()])
+    
+    currentResult = pd.DataFrame({
+            'method': RATKN.name, 
+            'runtime': RATKN.runtime, 
+            'overall_smape': RATKN.overall_smape, 
+            'overall_mae': RATKN.overall_mae,
+            'object_name': 'RATKN'
+            }, index = [0])
+    model_results = pd.concat([model_results, currentResult], ignore_index = True).reset_index(drop = True)
+    
     
     per_series_smape = np.zeros((len(test.columns),))
     try:
@@ -1344,8 +1694,9 @@ def model_evaluator(train, test, subset = 'All'):
     return final_result
 
 evaluator_result = model_evaluator(train, test, subset = series_to_sample)
+evaluator_result.errors
 eval_table = evaluator_result.model_performance.sort_values('overall_smape', ascending = True)
-eval_table.to_csv("Warehouse12_500of03.csv", index = False)
+eval_table.to_csv(output_name, index = False)
 print("Complete at: " + str(datetime.datetime.now()))
 
 """
@@ -1360,6 +1711,7 @@ Limit the context length to a standard length?
 Profile metadata of series (number NaN imputed, context length, etc)
 
 Capture volatility of results - basically get methods that do great on many even if they absymally fail on others
+    Median sMAPE
 
 Forecast distance blending (mix those more accurate in short term and long term) ensemble
 
