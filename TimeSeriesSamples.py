@@ -30,7 +30,7 @@ import pandas as pd
 import datetime
 
 use_sample_data = True # whether to use sample FRED time series or use a new dataset
-fredkey = 'XXXXXXXXXXXXXXXXXXx' # get from https://research.stlouisfed.org/docs/api/fred/
+fredkey = '93873d40f10c20fe6f6e75b1ad0aed4d' # get from https://research.stlouisfed.org/docs/api/fred/
 forecast_length = 90 # how much you will be predicting
 frequency = '1D'  # 'Offset aliases' from https://pandas.pydata.org/pandas-docs/stable/user_guide/timeseries.html
 no_negatives = True # True if all forecasts should be positive
@@ -224,6 +224,77 @@ def model_evaluator(train, test, subset = 'All'):
     trainEndDate = max(train.index)
     testStartDate = min(test.index)
     testEndDate = max(test.index)
+    """
+    Naives
+    """
+    Zeroes = ModelResult("All Zeroes")
+    try:
+        startTime = datetime.datetime.now()
+        Zeroes.forecast = (np.zeros((forecast_length,len(train.columns))))
+        Zeroes.runtime = datetime.datetime.now() - startTime
+        
+        Zeroes.mae = pd.DataFrame(mae(test.values, Zeroes.forecast)).mean(axis=0, skipna = True)
+        Zeroes.overall_mae = np.nanmean(Zeroes.mae)
+        Zeroes.smape = smape(test.values, Zeroes.forecast)
+        Zeroes.overall_smape = np.nanmean(Zeroes.smape)
+    except Exception as e:
+        print(e)
+        error_list.extend([traceback.format_exc()])
+    
+    currentResult = pd.DataFrame({
+            'method': Zeroes.name, 
+            'runtime': Zeroes.runtime, 
+            'overall_smape': Zeroes.overall_smape, 
+            'overall_mae': Zeroes.overall_mae,
+            'object_name': 'Zeroes'
+            }, index = [0])
+    model_results = pd.concat([model_results, currentResult], ignore_index = True).reset_index(drop = True)
+    
+    LastValue = ModelResult("Last Value Naive")
+    try:
+        startTime = datetime.datetime.now()
+        LastValue.forecast = np.tile(train.tail(1).values, (forecast_length,1))
+        LastValue.runtime = datetime.datetime.now() - startTime
+        
+        LastValue.mae = pd.DataFrame(mae(test.values, LastValue.forecast)).mean(axis=0, skipna = True)
+        LastValue.overall_mae = np.nanmean(LastValue.mae)
+        LastValue.smape = smape(test.values, LastValue.forecast)
+        LastValue.overall_smape = np.nanmean(LastValue.smape)
+    except Exception as e:
+        print(e)
+        error_list.extend([traceback.format_exc()])
+    
+    currentResult = pd.DataFrame({
+            'method': LastValue.name, 
+            'runtime': LastValue.runtime, 
+            'overall_smape': LastValue.overall_smape, 
+            'overall_mae': LastValue.overall_mae,
+            'object_name': 'LastValue'
+            }, index = [0])
+    model_results = pd.concat([model_results, currentResult], ignore_index = True).reset_index(drop = True)
+    
+    MedValue = ModelResult("Median Naive")
+    try:
+        startTime = datetime.datetime.now()
+        MedValue.forecast = np.tile(train.median(axis = 0).values, (forecast_length,1))
+        MedValue.runtime = datetime.datetime.now() - startTime
+        
+        MedValue.mae = pd.DataFrame(mae(test.values, MedValue.forecast)).mean(axis=0, skipna = True)
+        MedValue.overall_mae = np.nanmean(MedValue.mae)
+        MedValue.smape = smape(test.values, MedValue.forecast)
+        MedValue.overall_smape = np.nanmean(MedValue.smape)
+    except Exception as e:
+        print(e)
+        error_list.extend([traceback.format_exc()])
+    
+    currentResult = pd.DataFrame({
+            'method': MedValue.name, 
+            'runtime': MedValue.runtime, 
+            'overall_smape': MedValue.overall_smape, 
+            'overall_mae': MedValue.overall_mae,
+            'object_name': 'MedValue'
+            }, index = [0])
+    model_results = pd.concat([model_results, currentResult], ignore_index = True).reset_index(drop = True)
     
     """
     Linear Regression
@@ -232,8 +303,8 @@ def model_evaluator(train, test, subset = 'All'):
     try:
         from statsmodels.regression.linear_model import GLS
         startTime = datetime.datetime.now()
-        glm_model = GLS(train.values, (train.index.values), missing = 'drop').fit()
-        GLM.forecast = glm_model.predict(test.index.values)
+        glm_model = GLS(train.values, (train.index.astype( int ).values), missing = 'drop').fit()
+        GLM.forecast = glm_model.predict(test.index.astype( int ).values)
         if no_negatives:
             GLM.forecast = GLM.forecast.clip(min = 0)
         GLM.runtime = datetime.datetime.now() - startTime
@@ -372,7 +443,7 @@ def model_evaluator(train, test, subset = 'All'):
     """
     Markov AutoRegression - new to statsmodels 1.10, make sure you have recent version
     """
-    
+    """
     MarkovReg = ModelResult("MarkovRegression")
     try:
         from statsmodels.tsa.regime_switching.markov_regression import MarkovRegression
@@ -382,7 +453,7 @@ def model_evaluator(train, test, subset = 'All'):
             try:
                 current_series = train[series].copy()
                 current_series = current_series.fillna(method='ffill').fillna(method='bfill')
-                model = MarkovRegression(current_series, k_regimes=3, trend='nc', switching_variance=True).fit()
+                model = MarkovRegression(current_series, k_regimes=3, trend='nc', switching_variance=True).fit(em_iter=20,search_reps=20)
                 maPred = model.predict(start=testStartDate, end=testEndDate)
             except Exception:
                 try: # ETS if the above failed
@@ -425,7 +496,7 @@ def model_evaluator(train, test, subset = 'All'):
             try:
                 current_series = train[series].copy()
                 current_series = current_series.fillna(method='ffill').fillna(method='bfill')
-                model = MarkovAutoregression(current_series, k_regimes=2, order=4, switching_ar=False).fit()
+                model = MarkovAutoregression(current_series, k_regimes=2, order=4, switching_ar=False).fit(em_iter=20,search_reps=20)
                 maPred = model.predict(start=testStartDate, end=testEndDate)
             except Exception:
                 maPred = (np.zeros((forecast_length,)))
@@ -454,7 +525,7 @@ def model_evaluator(train, test, subset = 'All'):
             'object_name': 'MarkovAuto'
             }, index = [0])
     model_results = pd.concat([model_results, currentResult], ignore_index = True).reset_index(drop = True)
-    
+    """
     
     UnComp = ModelResult("UnobservedComponents")
     try:
@@ -1304,11 +1375,7 @@ def model_evaluator(train, test, subset = 'All'):
     
     RandForest = ModelResult("Random Forest Lag 1")
     try:
-        from sktime.transformers.compose import Tabulariser
         from sklearn.ensemble import RandomForestRegressor
-        from sktime.pipeline import Pipeline
-        from sktime.highlevel.tasks import ForecastingTask
-        from sktime.highlevel.strategies import Forecasting2TSRReductionStrategy
         startTime = datetime.datetime.now()
         sktraindata = train.dropna(how = 'all', axis = 0).fillna(method='ffill').fillna(method='bfill')
         Y = sktraindata.drop(sktraindata.head(1).index)
@@ -1344,6 +1411,45 @@ def model_evaluator(train, test, subset = 'All'):
             }, index = [0])
     model_results = pd.concat([model_results, currentResult], ignore_index = True).reset_index(drop = True)
     RandForest.result_message()
+    
+    LagRegr = ModelResult("ElasticNet Lag 1")
+    try:
+        from sklearn.linear_model import MultiTaskElasticNet
+        startTime = datetime.datetime.now()
+        sktraindata = train.dropna(how = 'all', axis = 0).fillna(method='ffill').fillna(method='bfill')
+        Y = sktraindata.drop(sktraindata.head(1).index)
+        X = sktraindata.drop(sktraindata.tail(1).index)
+        
+        regr = MultiTaskElasticNet(alpha = 1.0)
+        regr.fit(X, Y) 
+        
+        forecast = regr.predict(sktraindata.tail(1).values)
+        for x in range(forecast_length - 1):
+            rfPred = regr.predict(forecast[-1, :].reshape(1, -1))
+            if no_negatives:
+                rfPred[rfPred < 0] = 0
+            forecast = np.append(forecast, rfPred, axis = 0)
+        LagRegr.forecast = forecast
+        LagRegr.runtime = datetime.datetime.now() - startTime
+        
+        LagRegr.mae = pd.DataFrame(mae(test.values, LagRegr.forecast)).mean(axis=0, skipna = True)
+        LagRegr.overall_mae = np.nanmean(LagRegr.mae)
+        LagRegr.smape = smape(test.values, LagRegr.forecast)
+        LagRegr.overall_smape = np.nanmean(LagRegr.smape)
+        del(sktraindata)
+    except Exception as e:
+        print(e)
+        error_list.extend([traceback.format_exc()])
+    
+    currentResult = pd.DataFrame({
+            'method': LagRegr.name, 
+            'runtime': LagRegr.runtime, 
+            'overall_smape': LagRegr.overall_smape, 
+            'overall_mae': LagRegr.overall_mae,
+            'object_name': 'LagRegr'
+            }, index = [0])
+    model_results = pd.concat([model_results, currentResult], ignore_index = True).reset_index(drop = True)
+    LagRegr.result_message()
     
     RandFeaturedForest = ModelResult("Random Forest Lag 1, Roll 7 std, Roll 30 mean")
     try:
@@ -1405,7 +1511,7 @@ def model_evaluator(train, test, subset = 'All'):
         all_models = [GLM, sETS, ETS, dETS, ProphetResult, ProphetResultHoliday, 
      AutoArima, SARIMA, UnComp, GluonNPTS, GluonDeepAR, GluonMQCNN, GluonSFF,
      GluonWavenet, GluonDeepFactor, GluonDeepState, GluonTransformer, 
-     MarkovAuto, MarkovReg, SktimeKNN, SktimeAda, RandFeaturedForest, RandForest]
+     SktimeKNN, SktimeAda, RandFeaturedForest, RandForest, LagRegr]
         for modelmethod in all_models:
             if modelmethod.overall_smape != -1:
                 master_array = master_array + modelmethod.forecast
@@ -1464,7 +1570,7 @@ def model_evaluator(train, test, subset = 'All'):
             }, index = [0])
     model_results = pd.concat([model_results, currentResult], ignore_index = True).reset_index(drop = True)
     
-    bestN = ModelResult("Best N Ensemble")
+    bestN = ModelResult("Best 3 Ensemble")
     try:
         master_array = np.zeros((test.shape[0], test.shape[1]))
         
